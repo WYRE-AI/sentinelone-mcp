@@ -51,7 +51,13 @@ function idleEvictMs(): number {
 // tenant. In-flight spawns reserve a map slot before the first await and
 // count toward this cap; rejecting is still safer than evicting a live child.
 function maxChildren(): number {
-  return Number(process.env.MAX_CHILDREN ?? 50);
+  const raw = process.env.MAX_CHILDREN;
+  if (raw == null || raw.trim() === "") return 50;
+  const n = Number(raw);
+  // A non-numeric or non-positive value must not disable the cap. `NaN >= n`
+  // is false, which would let every new tenant through.
+  if (!Number.isInteger(n) || n < 1) return 50;
+  return n;
 }
 
 export const LISTEN_PORT = PORT;
@@ -60,6 +66,8 @@ interface TenantChild {
   port: number;
   /** Null until the process has been spawned. */
   proc: ChildProcess | null;
+  /** True once the child is accepting HTTP. Idle eviction skips earlier states. */
+  booted: boolean;
   /** Resolves once the child is accepting HTTP, rejects if the spawn fails. */
   ready: Promise<void>;
   lastUsed: number;
@@ -67,6 +75,8 @@ interface TenantChild {
 }
 
 const children = new Map<string, TenantChild>();
+/** Set by shutdown so a spawn still in allocatePort does not outlive the process. */
+let shuttingDown = false;
 
 /** Interpreter + cwd resolved per spawn so tests can point at a missing binary. */
 function resolvePurpleMcpLaunch(): { python: string; cwd: string } {
@@ -141,6 +151,27 @@ function forgetChild(credHash: string, child: TenantChild): void {
   if (children.get(credHash) === child) children.delete(credHash);
 }
 
+/**
+ * Signal a child. Returns true if the process is already gone or the signal
+ * was delivered. `kill()` returns false (and sometimes throws) when the
+ * signal was not delivered; callers must not drop tracking in that case
+ * unless the spawn itself has already failed.
+ */
+function signalChild(child: TenantChild, signal: NodeJS.Signals): boolean {
+  const proc = child.proc;
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return true;
+  try {
+    const delivered = proc.kill(signal);
+    if (!delivered) {
+      process.stderr.write(`[s1:${child.credHash}] ${signal} was not delivered\n`);
+    }
+    return delivered;
+  } catch (err) {
+    process.stderr.write(`[s1:${child.credHash}] ${signal} failed: ${err}\n`);
+    return false;
+  }
+}
+
 function deferredReady(): {
   promise: Promise<void>;
   resolve: () => void;
@@ -187,6 +218,7 @@ async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantCh
   const child: TenantChild = {
     port: 0,
     proc: null,
+    booted: false,
     ready: pending.promise,
     lastUsed: Date.now(),
     credHash,
@@ -199,15 +231,19 @@ async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantCh
     return child;
   } catch (err) {
     pending.reject(err);
-    try { child.proc?.kill("SIGKILL"); } catch { /* ignore */ }
+    if (!signalChild(child, "SIGKILL")) {
+      process.stderr.write(`[s1:${credHash}] failed to kill child after spawn error\n`);
+    }
     forgetChild(credHash, child);
     throw err;
   }
 }
 
 async function launchChild(child: TenantChild, token: string, baseUrl: string): Promise<void> {
+  if (shuttingDown) throw new Error("sentinelone-mcp is shutting down");
   const { credHash } = child;
   const port = await allocatePort();
+  if (shuttingDown) throw new Error("sentinelone-mcp is shutting down");
   child.port = port;
   // Random auth token — purple-mcp's docker-entrypoint refuses the placeholder
   // value, and on streamable-http with --allow-remote-access we want a token
@@ -250,6 +286,10 @@ async function launchChild(child: TenantChild, token: string, baseUrl: string): 
     },
   );
   child.proc = proc;
+  if (shuttingDown) {
+    signalChild(child, "SIGTERM");
+    throw new Error("sentinelone-mcp is shutting down");
+  }
 
   // Tag child stdout/stderr with the tenant hash for debuggability.
   proc.stdout?.on("data", (chunk) => {
@@ -289,19 +329,23 @@ async function launchChild(child: TenantChild, token: string, baseUrl: string): 
 
   await waitForReady(port, spawnReadyTimeoutMs(), () => spawnError);
   bootFinished = true;
+  child.booted = true;
 }
 
 /** Drop idle children. Started from the process entrypoint, not on import. */
 export function evictIdleChildren(now = Date.now()): void {
+  const idleMs = idleEvictMs();
   for (const [hash, child] of children) {
-    const idleMs = idleEvictMs();
-    if (now - child.lastUsed > idleMs) {
-      process.stderr.write(`[s1:${hash}] evicting idle child after ${idleMs}ms\n`);
-      // Remove first, then signal. A late `exit` must not delete a replacement
-      // that reserved this hash before the old process actually died.
-      forgetChild(hash, child);
-      try { child.proc?.kill("SIGTERM"); } catch { /* ignore */ }
-    }
+    // A reserved child may not have a process yet. Removing it now would let
+    // launchChild finish untracked, and a later `exit` would not be this child.
+    if (!child.booted) continue;
+    if (now - child.lastUsed <= idleMs) continue;
+    process.stderr.write(`[s1:${hash}] evicting idle child after ${idleMs}ms\n`);
+    // Signal first. Only drop the entry if the signal was delivered (or the
+    // process is already gone). A late `exit` then cannot delete a replacement
+    // that reserved this hash before the old process actually died.
+    if (!signalChild(child, "SIGTERM")) continue;
+    forgetChild(hash, child);
   }
 }
 
@@ -457,8 +501,12 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
 }
 
 export function shutdownChildren(signal: string): void {
+  shuttingDown = true;
   process.stderr.write(`[s1] received ${signal}, shutting down\n`);
   for (const [, child] of children) {
-    try { child.proc?.kill("SIGTERM"); } catch { /* ignore */ }
+    if (!child.proc) continue;
+    if (!signalChild(child, "SIGTERM")) {
+      process.stderr.write(`[s1:${child.credHash}] shutdown signal failed\n`);
+    }
   }
 }

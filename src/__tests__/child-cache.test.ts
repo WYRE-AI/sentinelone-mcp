@@ -160,6 +160,34 @@ describe("tenant child cache", () => {
     expect(health.json().tenants).toBe(0);
   });
 
+  it("does not evict a child that is still starting", async () => {
+    process.env.SPAWN_DELAY_MS = "400";
+    const pending = post("tok-boot", "https://boot.sentinelone.net");
+    await new Promise((r) => setTimeout(r, 40));
+    evictIdleChildren();
+    const mid = await app.inject({ method: "GET", url: "/health" });
+    expect(mid.json().tenants).toBe(1);
+    const res = await pending;
+    expect(res.statusCode).toBe(200);
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.json().tenants).toBe(1);
+    expect(pids()).toHaveLength(1);
+  });
+
+  it("falls back to the default cap when MAX_CHILDREN is not a positive integer", async () => {
+    process.env.MAX_CHILDREN = "nope";
+    const [a, b] = await Promise.all([
+      post("tok-cap-a", "https://a.sentinelone.net"),
+      post("tok-cap-b", "https://b.sentinelone.net"),
+    ]);
+    expect(a.statusCode).toBe(200);
+    expect(b.statusCode).toBe(200);
+    expect(pids()).toHaveLength(2);
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.json().maxTenants).toBe(50);
+    expect(health.json().tenants).toBe(2);
+  });
+
   it("does not drop a replacement child when the evicted process exits", async () => {
     const first = await post("tok-replace", "https://replace.sentinelone.net");
     expect(first.statusCode).toBe(200);
