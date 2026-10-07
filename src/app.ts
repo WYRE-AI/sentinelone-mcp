@@ -39,23 +39,28 @@ const PURPLE_MCP_DIR = process.env.PURPLE_MCP_DIR ?? "/opt/purple-mcp";
 // enforces a short per-vendor tool-fetch timeout — so an aggressive idle evict
 // makes the first call after each gap pay that cold start and risk a gateway
 // timeout. A longer TTL keeps steady-state traffic on a warm child.
-const IDLE_EVICT_MS = Number(process.env.IDLE_EVICT_MS ?? 60 * 60 * 1000); // 60 min
+function idleEvictMs(): number {
+  return Number(process.env.IDLE_EVICT_MS ?? 60 * 60 * 1000); // 60 min
+}
 // Hard cap on distinct concurrent tenant children. Without this, a burst of
 // distinct tenants can spawn unbounded purple-mcp processes (each with real
 // memory/CPU footprint), risking resource exhaustion for the whole gateway.
 // We deliberately reject NEW tenant capacity rather than evicting an existing
-// child to make room: there's no in-flight/"busy" tracking on TenantChild
-// today (only lastUsed, bumped at request start), so an LRU-style evict could
-// kill a child mid-flight on a concurrent request from that same tenant.
-// Rejecting is safe; evicting-to-make-room is a bigger design decision that
-// needs real busy-tracking first.
-const MAX_CHILDREN = Number(process.env.MAX_CHILDREN ?? 50);
+// child to make room. lastUsed is bumped at request start, so an LRU-style
+// evict could kill a child mid-flight on a concurrent request from that same
+// tenant. In-flight spawns reserve a map slot before the first await and
+// count toward this cap; rejecting is still safer than evicting a live child.
+function maxChildren(): number {
+  return Number(process.env.MAX_CHILDREN ?? 50);
+}
 
 export const LISTEN_PORT = PORT;
 
 interface TenantChild {
   port: number;
-  proc: ChildProcess;
+  /** Null until the process has been spawned. */
+  proc: ChildProcess | null;
+  /** Resolves once the child is accepting HTTP, rejects if the spawn fails. */
   ready: Promise<void>;
   lastUsed: number;
   credHash: string;
@@ -131,24 +136,79 @@ async function waitForReady(
   throw new Error(`purple-mcp child did not become ready within ${timeoutMs}ms`);
 }
 
+/** Drop the cache entry only when it still points at this child. */
+function forgetChild(credHash: string, child: TenantChild): void {
+  if (children.get(credHash) === child) children.delete(credHash);
+}
+
+function deferredReady(): {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (err: unknown) => void;
+} {
+  let resolve!: () => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  // The spawning request observes failure via its own try/catch. This handler
+  // covers the case where no second caller is awaiting `ready`.
+  promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+
 async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantChild> {
   const credHash = hashCreds(token, baseUrl);
   const existing = children.get(credHash);
   if (existing) {
     existing.lastUsed = Date.now();
+    // The cached child may still be in its cold start. Wait for that spawn
+    // instead of proxying to a port that is not listening yet.
+    await existing.ready;
     return existing;
   }
 
   // Cache miss: we're about to spawn a NEW tenant child. If we're already at
   // capacity, refuse rather than evict — see MAX_CHILDREN comment above for
-  // why eviction isn't safe here.
-  if (children.size >= MAX_CHILDREN) {
+  // why eviction isn't safe here. In-flight reservations already sit in
+  // `children`, so this count includes spawns that have not finished booting.
+  const max = maxChildren();
+  if (children.size >= max) {
     throw new Error(
-      `Tenant capacity limit reached (${MAX_CHILDREN} concurrent SentinelOne tenants); try again shortly`,
+      `Tenant capacity limit reached (${max} concurrent SentinelOne tenants); try again shortly`,
     );
   }
 
+  // Reserve the slot synchronously, before allocatePort() or spawn yield.
+  // Otherwise two callers for the same tenant can both miss the cache, and
+  // two distinct tenants can both pass the capacity check.
+  const pending = deferredReady();
+  const child: TenantChild = {
+    port: 0,
+    proc: null,
+    ready: pending.promise,
+    lastUsed: Date.now(),
+    credHash,
+  };
+  children.set(credHash, child);
+
+  try {
+    await launchChild(child, token, baseUrl);
+    pending.resolve();
+    return child;
+  } catch (err) {
+    pending.reject(err);
+    try { child.proc?.kill("SIGKILL"); } catch { /* ignore */ }
+    forgetChild(credHash, child);
+    throw err;
+  }
+}
+
+async function launchChild(child: TenantChild, token: string, baseUrl: string): Promise<void> {
+  const { credHash } = child;
   const port = await allocatePort();
+  child.port = port;
   // Random auth token — purple-mcp's docker-entrypoint refuses the placeholder
   // value, and on streamable-http with --allow-remote-access we want a token
   // set anyway. We don't expose this child to the network, only loopback,
@@ -189,6 +249,7 @@ async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantCh
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  child.proc = proc;
 
   // Tag child stdout/stderr with the tenant hash for debuggability.
   proc.stdout?.on("data", (chunk) => {
@@ -206,53 +267,47 @@ async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantCh
   // the /mcp handler returns a clean 502 for this tenant. The next request
   // retries a fresh spawn.
   let spawnError: Error | null = null;
+  let bootFinished = false;
   // `on`, not `once`: a failed spawn emits 'error', and the cleanup `kill`
   // below can emit a second one. With no listener Node re-throws it and
   // takes down every tenant.
   proc.on("error", (err) => {
     spawnError = err;
     process.stderr.write(`[s1:${credHash}] purple-mcp failed to spawn: ${err}\n`);
-    children.delete(credHash);
+    forgetChild(credHash, child);
   });
 
   proc.on("exit", (code, signal) => {
     process.stderr.write(`[s1:${credHash}] purple-mcp exited code=${code} signal=${signal}\n`);
-    children.delete(credHash);
+    // Only a death during boot is a spawn failure. A later exit (idle
+    // eviction, crash) just drops this entry if it is still the current one.
+    if (!bootFinished && !spawnError) {
+      spawnError = new Error(`purple-mcp exited before ready code=${code} signal=${signal}`);
+    }
+    forgetChild(credHash, child);
   });
 
-  const ready = waitForReady(port, spawnReadyTimeoutMs(), () => spawnError);
-  const child: TenantChild = {
-    port,
-    proc,
-    ready,
-    lastUsed: Date.now(),
-    credHash,
-  };
-  children.set(credHash, child);
+  await waitForReady(port, spawnReadyTimeoutMs(), () => spawnError);
+  bootFinished = true;
+}
 
-  try {
-    await ready;
-  } catch (err) {
-    // If it never came up, kill and remove so the next request retries cleanly.
-    try { proc.kill("SIGKILL"); } catch { /* ignore */ }
-    children.delete(credHash);
-    throw err;
+/** Drop idle children. Started from the process entrypoint, not on import. */
+export function evictIdleChildren(now = Date.now()): void {
+  for (const [hash, child] of children) {
+    const idleMs = idleEvictMs();
+    if (now - child.lastUsed > idleMs) {
+      process.stderr.write(`[s1:${hash}] evicting idle child after ${idleMs}ms\n`);
+      // Remove first, then signal. A late `exit` must not delete a replacement
+      // that reserved this hash before the old process actually died.
+      forgetChild(hash, child);
+      try { child.proc?.kill("SIGTERM"); } catch { /* ignore */ }
+    }
   }
-  return child;
 }
 
 /** Idle eviction sweep. Started from the process entrypoint, not on import. */
 export function startIdleEviction(): NodeJS.Timeout {
-  const timer = setInterval(() => {
-    const now = Date.now();
-    for (const [hash, child] of children) {
-      if (now - child.lastUsed > IDLE_EVICT_MS) {
-        process.stderr.write(`[s1:${hash}] evicting idle child after ${IDLE_EVICT_MS}ms\n`);
-        try { child.proc.kill("SIGTERM"); } catch { /* ignore */ }
-        children.delete(hash);
-      }
-    }
-  }, 60_000);
+  const timer = setInterval(() => evictIdleChildren(), 60_000);
   timer.unref();
   return timer;
 }
@@ -282,7 +337,7 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
   app.get("/health", async () => ({
     status: "ok",
     tenants: children.size,
-    maxTenants: MAX_CHILDREN,
+    maxTenants: maxChildren(),
   }));
 
   // We accept the request body as a Buffer so we can forward it verbatim
@@ -404,6 +459,6 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
 export function shutdownChildren(signal: string): void {
   process.stderr.write(`[s1] received ${signal}, shutting down\n`);
   for (const [, child] of children) {
-    try { child.proc.kill("SIGTERM"); } catch { /* ignore */ }
+    try { child.proc?.kill("SIGTERM"); } catch { /* ignore */ }
   }
 }

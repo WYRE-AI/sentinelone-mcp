@@ -9,7 +9,7 @@ Multitenant Streamable HTTP wrapper for [sentinel-one/purple-mcp](https://github
 This image bundles `purple-mcp` plus a small Node/Fastify proxy. The proxy:
 
 1. Listens on `:8080` with `POST /mcp` and `GET /health`.
-2. Reads `X-S1-API-Token` and `X-S1-Console-URL` from each incoming request (legacy `x-purplemcp-token` / `x-purplemcp-base-url` still accepted). A request with neither pair gets **401**, which Conduit's vendor-monitor treats as reachable but auth-gated.
+2. Reads `X-S1-API-Token` and `X-S1-Console-URL` from each incoming request (legacy `x-purplemcp-token` / `x-purplemcp-base-url` still accepted). A request missing either the token or the console URL, after per-field fallback, gets **401**, which Conduit's vendor-monitor treats as reachable but auth-gated.
 3. Lazily spawns one `purple-mcp --mode streamable-http` child per `(token, base-url)` tenant on a private loopback port, with the right env vars set.
 4. Proxies the request body to that child and streams the response back.
 5. Evicts idle children after 60 minutes (`IDLE_EVICT_MS`).
