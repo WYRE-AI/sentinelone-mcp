@@ -8,7 +8,9 @@
 # gateway forwards per-tenant credentials as HTTP headers on every request,
 # so this image runs a small Node proxy on port 8080 that:
 #
-#   1. Reads the SentinelOne credential headers from the incoming request
+#   1. Reads X-S1-API-Token / X-S1-Console-URL (legacy x-purplemcp-* still
+#      accepted). Missing credentials answer 401 so vendor-monitor counts
+#      the sidecar reachable.
 #   2. Lazily spawns one purple-mcp child per (token, base_url) tenant on a
 #      private loopback port with the right env vars
 #   3. Proxies the request to that child and streams the response back

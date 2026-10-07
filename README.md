@@ -9,7 +9,7 @@ Multitenant Streamable HTTP wrapper for [sentinel-one/purple-mcp](https://github
 This image bundles `purple-mcp` plus a small Node/Fastify proxy. The proxy:
 
 1. Listens on `:8080` with `POST /mcp` and `GET /health`.
-2. Reads `x-purplemcp-token` and `x-purplemcp-base-url` from each incoming request.
+2. Reads `X-S1-API-Token` and `X-S1-Console-URL` from each incoming request (legacy `x-purplemcp-token` / `x-purplemcp-base-url` still accepted). A request missing either the token or the console URL, after per-field fallback, gets **401**, which Conduit's vendor-monitor treats as reachable but auth-gated.
 3. Lazily spawns one `purple-mcp --mode streamable-http` child per `(token, base-url)` tenant on a private loopback port, with the right env vars set.
 4. Proxies the request body to that child and streams the response back.
 5. Evicts idle children after 60 minutes (`IDLE_EVICT_MS`).
@@ -30,12 +30,16 @@ The result is a single container that the gateway can talk to like any other ven
 
 ## Request headers
 
-The gateway must forward these headers on every `/mcp` request:
+The gateway must forward these headers on every authenticated `/mcp` request. Names are case-insensitive. When both pairs are present, the `X-S1-*` value wins per field.
 
 | Header | SentinelOne credential |
 |---|---|
-| `x-purplemcp-token` | `PURPLEMCP_CONSOLE_TOKEN` (Account- or Site-level service user token) |
-| `x-purplemcp-base-url` | `PURPLEMCP_CONSOLE_BASE_URL` (e.g. `https://yourtenant.sentinelone.net`) |
+| `X-S1-API-Token` | `PURPLEMCP_CONSOLE_TOKEN` (Account- or Site-level service user token). Catalog `headerMapping` name. |
+| `X-S1-Console-URL` | `PURPLEMCP_CONSOLE_BASE_URL` (e.g. `https://yourtenant.sentinelone.net`). Catalog `headerMapping` name. |
+| `x-purplemcp-token` | Legacy alias for the API token. |
+| `x-purplemcp-base-url` | Legacy alias for the console URL. |
+
+`POST /mcp` without a token and console URL returns **401** (JSON-RPC `-32001`). Vendor-monitor's credless `initialize` probe relies on that: 401/403 means the sidecar is up but auth-gated, while 400 marks the slug DOWN. `GET /health` stays unauthenticated.
 
 ## Build
 
