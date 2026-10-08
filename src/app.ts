@@ -26,11 +26,12 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import Fastify, { type FastifyInstance } from "fastify";
 import { readTenantCredentials } from "./credentials.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
+import { hashCreds } from "./tenant-key.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const PURPLE_MCP_DIR = process.env.PURPLE_MCP_DIR ?? "/opt/purple-mcp";
@@ -105,10 +106,6 @@ function allocatePort(): Promise<number> {
       }
     });
   });
-}
-
-function hashCreds(token: string, baseUrl: string): string {
-  return createHash("sha256").update(`${token}\0${baseUrl}`).digest("hex").slice(0, 16);
 }
 
 /**
