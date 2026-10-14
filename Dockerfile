@@ -69,10 +69,14 @@ RUN npm run build
 # ---- Stage 3: runtime image ----
 FROM python:3.14-slim AS runtime
 
+# 0.0.0.0 is the in-container bind. Startup still refuses to listen without a
+# real CONDUIT_S2S_SECRET. MCP_ALLOW_INSECURE_DEV=1 refuses this host and only
+# binds 127.0.0.1. Credentials are per-request headers, not image env.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     NODE_ENV=production \
-    PORT=8080
+    PORT=8080 \
+    MCP_HTTP_HOST=0.0.0.0
 
 # Install Node.js 22 (no apt repo - use the official tarball)
 RUN apt-get update \
@@ -102,4 +106,6 @@ COPY --from=proxy-build /app/package.json ./package.json
 LABEL io.modelcontextprotocol.server.name="io.github.WYRE-AI/sentinelone-mcp"
 
 EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD ["curl", "-fsS", "http://127.0.0.1:8080/health"]
 CMD ["node", "dist/index.js"]

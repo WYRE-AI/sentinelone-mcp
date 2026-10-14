@@ -10,7 +10,10 @@
  *   per-tenant child processes.
  *
  * Strategy:
- *   - Listen on 0.0.0.0:8080 with `POST /mcp` and `GET /health`.
+ *   - Listen with `POST /mcp` and `GET /health`. A configured
+ *     CONDUIT_S2S_SECRET honors MCP_HTTP_HOST (unset keeps 0.0.0.0). With no
+ *     secret, startup refuses unless MCP_ALLOW_INSECURE_DEV=1, which binds
+ *     127.0.0.1 only.
  *   - For each /mcp request, read X-S1-API-Token / X-S1-Console-URL
  *     (legacy x-purplemcp-token / x-purplemcp-base-url still accepted).
  *   - Look up (or lazily spawn) a purple-mcp child for that tenant on a
@@ -31,6 +34,12 @@ import { createServer } from "node:net";
 import Fastify, { type FastifyInstance } from "fastify";
 import { readTenantCredentials } from "./credentials.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
+import {
+  INSECURE_DEV_WARNING,
+  rejectPlaceholderSecret,
+  resolveBindHost,
+  resolveS2sSecret,
+} from "./s2s-startup.js";
 import { hashCreds } from "./tenant-key.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -355,21 +364,36 @@ export function startIdleEviction(): NodeJS.Timeout {
 
 export interface BuildAppOptions {
   /**
-   * Override `CONDUIT_S2S_SECRET` (tests). Production omits this and reads
-   * the env at startup, same as before: empty means enforcement is off.
+   * Override the resolved S2S secret (tests). Production startup passes the
+   * value from `resolveS2sSecret()`. An empty string skips the header check
+   * and is only reachable for tests or after MCP_ALLOW_INSECURE_DEV=1.
+   * Known placeholders are refused here too.
    */
   s2sSecret?: string;
   /** Pass `false` to silence Fastify logs (tests). */
   logger?: false;
 }
 
+function singleHeader(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) return singleHeader(value[0]);
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 // ---------- HTTP server ----------
 
 export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
-  // Captured once per app, matching the previous module-load read of
-  // CONDUIT_S2S_SECRET. Empty => S2S enforcement disabled (dark-by-default).
-  const s2sSecret =
-    opts.s2sSecret !== undefined ? opts.s2sSecret : process.env.CONDUIT_S2S_SECRET || "";
+  // One read of CONDUIT_S2S_SECRET, fail-closed. An explicit option is how
+  // tests (and the insecure-dev listen path) supply the already-resolved value.
+  // Empty is not a production "enforcement disabled" switch.
+  let s2sSecret: string;
+  if (opts.s2sSecret !== undefined) {
+    s2sSecret = opts.s2sSecret.trim();
+    rejectPlaceholderSecret(s2sSecret);
+  } else {
+    s2sSecret = resolveS2sSecret().secret;
+  }
 
   const app = Fastify({
     logger: opts.logger === false ? false : { level: process.env.LOG_LEVEL ?? "info" },
@@ -391,13 +415,19 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
   );
 
   app.post("/mcp", async (req, reply) => {
-    if (s2sSecret && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, s2sSecret)) {
+    // Empty s2sSecret is only reachable for tests or MCP_ALLOW_INSECURE_DEV=1.
+    // A configured secret is always enforced, before any credential extraction.
+    const presented = singleHeader(req.headers[S2S_HEADER]);
+    if (s2sSecret && !verifyS2sHeader(presented, s2sSecret)) {
       reply.code(401);
       return {
         error: "Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.",
       };
     }
 
+    // Gateway mode: tenant credentials come only from request headers.
+    // PURPLEMCP_CONSOLE_TOKEN / PURPLEMCP_CONSOLE_BASE_URL in the process
+    // environment are not a fallback — a missing header pair is 401.
     const creds = readTenantCredentials(req.headers);
 
     if (!creds) {
@@ -494,6 +524,30 @@ export function buildApp(opts: BuildAppOptions = {}): FastifyInstance {
     return reply.send(nodeStream);
   });
 
+  return app;
+}
+
+/**
+ * HTTP entrypoint. Refuses to listen without a real CONDUIT_S2S_SECRET unless
+ * MCP_ALLOW_INSECURE_DEV=1, which forces 127.0.0.1. A configured secret honors
+ * MCP_HTTP_HOST. GET /health stays unauthenticated.
+ */
+export async function startHttpServer(opts: { logger?: false } = {}): Promise<FastifyInstance> {
+  const decision = resolveS2sSecret();
+  const host = resolveBindHost(decision.insecureDev);
+  if (decision.insecureDev) {
+    // Logged only after resolveBindHost accepts a loopback host, so a refused
+    // non-loopback MCP_HTTP_HOST does not claim the server is starting.
+    // console.error so LOG_LEVEL cannot hide it. The secret is not included.
+    console.error(INSECURE_DEV_WARNING);
+  }
+  const app = buildApp({ logger: opts.logger, s2sSecret: decision.secret });
+  const port = Number(process.env.PORT ?? 8080);
+  await app.listen({ host, port });
+  const bound = app.server.address();
+  const where =
+    bound && typeof bound === "object" ? `${bound.address}:${bound.port}` : `${host}:${port}`;
+  process.stderr.write(`[s1] sentinelone-mcp wrapper listening on ${where}\n`);
   return app;
 }
 
