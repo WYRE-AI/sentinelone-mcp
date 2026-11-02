@@ -67,7 +67,7 @@ COPY src ./src
 RUN npm run build
 
 # ---- Stage 3: runtime image ----
-FROM python:3.14-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 # 0.0.0.0 is the in-container bind. Startup still refuses to listen without a
 # real CONDUIT_S2S_SECRET. MCP_ALLOW_INSECURE_DEV=1 refuses this host and only
