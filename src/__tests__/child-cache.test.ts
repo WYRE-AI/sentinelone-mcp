@@ -23,13 +23,13 @@ writeFileSync(
   python,
   `#!/usr/bin/env node
 import http from "node:http";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 const args = process.argv;
 const port = Number(args[args.indexOf("--port") + 1]);
 if (process.env.SPAWN_LOG) appendFileSync(process.env.SPAWN_LOG, process.pid + "\\n");
 const delay = Number(process.env.SPAWN_DELAY_MS || 0);
-setTimeout(() => {
-  if (process.env.SPAWN_MODE === "fail") {
+function start(mode) {
+  if (mode === "fail") {
     process.exit(1);
     return;
   }
@@ -37,7 +37,21 @@ setTimeout(() => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ jsonrpc: "2.0", id: null, result: { ok: true } }));
   }).listen(port, "127.0.0.1");
-}, delay);
+}
+if (process.env.SPAWN_GATE) {
+  // Bound idle time if a test is interrupted before it releases the gate.
+  const idleCap = setTimeout(() => process.exit(1), 30_000);
+  const poll = setInterval(() => {
+    let mode;
+    try { mode = readFileSync(process.env.SPAWN_GATE, "utf8").trim(); } catch { return; }
+    if (mode !== "serve" && mode !== "fail") return;
+    clearInterval(poll);
+    clearTimeout(idleCap);
+    start(mode);
+  }, 10);
+} else {
+  setTimeout(() => start(process.env.SPAWN_MODE), delay);
+}
 `,
 );
 chmodSync(python, 0o755);
@@ -83,6 +97,7 @@ describe("tenant child cache", () => {
     process.env.PURPLE_MCP_DIR = root;
     process.env.SPAWN_LOG = spawnLog;
     process.env.SPAWN_MODE = "serve";
+    delete process.env.SPAWN_GATE;
   });
 
   afterEach(async () => {
@@ -132,7 +147,8 @@ describe("tenant child cache", () => {
 
   it("reuses a still-starting child after the first ready timeout", async () => {
     process.env.SPAWN_READY_TIMEOUT_MS = "600";
-    process.env.SPAWN_DELAY_MS = "900";
+    const gate = join(mkdtempSync(join(root, "reuse-")), "gate");
+    process.env.SPAWN_GATE = gate;
 
     const first = await post("tok-slow-start", "https://slow-start.sentinelone.net");
     expect(first.statusCode).toBe(502);
@@ -143,19 +159,19 @@ describe("tenant child cache", () => {
     expect(health.json().tenants).toBe(1);
     expect(pids()).toHaveLength(1);
 
-    await new Promise((r) => setTimeout(r, 400));
+    writeFileSync(gate, "serve");
     const second = await post("tok-slow-start", "https://slow-start.sentinelone.net");
     expect(second.statusCode).toBe(200);
     expect(pids()).toHaveLength(1);
   });
 
   it.each([
-    { mode: "fail", delay: "900", message: "exited before ready" },
-    { mode: "serve", delay: "10000", message: "did not become ready" },
-  ])("forgets the child when the follow-up wait fails ($mode)", async ({ mode, delay, message }) => {
+    { mode: "fail", message: "exited before ready" },
+    { mode: "serve", message: "did not become ready" },
+  ])("forgets the child when the follow-up wait fails ($mode)", async ({ mode, message }) => {
     process.env.SPAWN_READY_TIMEOUT_MS = "600";
-    process.env.SPAWN_DELAY_MS = delay;
-    process.env.SPAWN_MODE = mode;
+    const gate = join(mkdtempSync(join(root, "follow-up-")), "gate");
+    process.env.SPAWN_GATE = gate;
     const token = `tok-follow-up-${mode}`;
     const baseUrl = `https://follow-up-${mode}.sentinelone.net`;
 
@@ -164,7 +180,9 @@ describe("tenant child cache", () => {
     expect(first.json().error.message).toContain("did not become ready");
     const mid = await app.inject({ method: "GET", url: "/health" });
     expect(mid.json().tenants).toBe(1);
+    expect(pids()).toHaveLength(1);
 
+    if (mode === "fail") writeFileSync(gate, "fail");
     const second = await post(token, baseUrl);
     expect(second.statusCode).toBe(502);
     expect(second.json().error.code).toBe(-32002);
@@ -173,6 +191,18 @@ describe("tenant child cache", () => {
     const health = await app.inject({ method: "GET", url: "/health" });
     expect(health.json().tenants).toBe(0);
   });
+
+  it.each([undefined, "", "  ", "nope", "0", "-1", "1.5", "Infinity"])(
+    "falls back to the default ready timeout for %s",
+    async (value) => {
+      if (value === undefined) delete process.env.SPAWN_READY_TIMEOUT_MS;
+      else process.env.SPAWN_READY_TIMEOUT_MS = value;
+
+      const response = await post("tok-timeout-default", "https://timeout-default.sentinelone.net");
+      expect(response.statusCode).toBe(200);
+      expect(pids()).toHaveLength(1);
+    },
+  );
 
   it("counts an in-flight spawn toward MAX_CHILDREN", async () => {
     const [a, b] = await Promise.all([

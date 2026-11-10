@@ -96,7 +96,11 @@ function resolvePurpleMcpLaunch(): { python: string; cwd: string } {
 }
 
 function spawnReadyTimeoutMs(): number {
-  return Number(process.env.SPAWN_READY_TIMEOUT_MS ?? 90_000);
+  const raw = process.env.SPAWN_READY_TIMEOUT_MS;
+  if (raw == null || raw.trim() === "") return 90_000;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return 90_000;
+  return n;
 }
 
 /** Allocate a free TCP port on 127.0.0.1 by binding ephemeral and reading it back. */
