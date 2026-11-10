@@ -96,7 +96,7 @@ function resolvePurpleMcpLaunch(): { python: string; cwd: string } {
 }
 
 function spawnReadyTimeoutMs(): number {
-  return Number(process.env.SPAWN_READY_TIMEOUT_MS ?? 30_000);
+  return Number(process.env.SPAWN_READY_TIMEOUT_MS ?? 90_000);
 }
 
 /** Allocate a free TCP port on 127.0.0.1 by binding ephemeral and reading it back. */
@@ -231,11 +231,35 @@ async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantCh
   };
   children.set(credHash, child);
 
+  let waitUntilReady: (() => Promise<void>) | undefined;
   try {
-    await launchChild(child, token, baseUrl);
+    waitUntilReady = await launchChild(child, token, baseUrl);
+    await waitUntilReady();
     pending.resolve();
     return child;
   } catch (err) {
+    if (
+      err instanceof Error &&
+      err.message.startsWith("purple-mcp child did not become ready within") &&
+      child.proc &&
+      child.proc.exitCode === null &&
+      child.proc.signalCode === null &&
+      children.get(credHash) === child &&
+      waitUntilReady
+    ) {
+      const followUp = deferredReady();
+      child.ready = followUp.promise;
+      pending.reject(err);
+      process.stderr.write(`[s1:${credHash}] keeping still-starting child after ready timeout\n`);
+      void waitUntilReady().then(followUp.resolve, (followUpError) => {
+        followUp.reject(followUpError);
+        if (!signalChild(child, "SIGKILL")) {
+          process.stderr.write(`[s1:${credHash}] failed to kill child after spawn error\n`);
+        }
+        forgetChild(credHash, child);
+      });
+      throw err;
+    }
     pending.reject(err);
     if (!signalChild(child, "SIGKILL")) {
       process.stderr.write(`[s1:${credHash}] failed to kill child after spawn error\n`);
@@ -245,7 +269,11 @@ async function getOrSpawnChild(token: string, baseUrl: string): Promise<TenantCh
   }
 }
 
-async function launchChild(child: TenantChild, token: string, baseUrl: string): Promise<void> {
+async function launchChild(
+  child: TenantChild,
+  token: string,
+  baseUrl: string,
+): Promise<() => Promise<void>> {
   if (shuttingDown) throw new Error("sentinelone-mcp is shutting down");
   const { credHash } = child;
   const port = await allocatePort();
@@ -333,9 +361,12 @@ async function launchChild(child: TenantChild, token: string, baseUrl: string): 
     forgetChild(credHash, child);
   });
 
-  await waitForReady(port, spawnReadyTimeoutMs(), () => spawnError);
-  bootFinished = true;
-  child.booted = true;
+  const timeoutMs = spawnReadyTimeoutMs();
+  return async () => {
+    await waitForReady(port, timeoutMs, () => spawnError);
+    bootFinished = true;
+    child.booted = true;
+  };
 }
 
 /** Drop idle children. Started from the process entrypoint, not on import. */

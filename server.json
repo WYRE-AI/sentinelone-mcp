@@ -33,9 +33,9 @@
         },
         {
           "name": "SPAWN_READY_TIMEOUT_MS",
-          "description": "How long to wait for a spawned child to start serving HTTP (ms)",
+          "description": "How long to wait for a spawned child to start serving HTTP (ms, default 90s). A still-starting child is kept after the first timeout for reuse by the next request instead of killing and respawning it; a second timeout cleans it up.",
           "isRequired": false,
-          "default": "30000",
+          "default": "90000",
           "format": "string"
         },
         {

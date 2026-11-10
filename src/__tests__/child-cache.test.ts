@@ -130,6 +130,50 @@ describe("tenant child cache", () => {
     expect(health.json().tenants).toBe(1);
   });
 
+  it("reuses a still-starting child after the first ready timeout", async () => {
+    process.env.SPAWN_READY_TIMEOUT_MS = "600";
+    process.env.SPAWN_DELAY_MS = "900";
+
+    const first = await post("tok-slow-start", "https://slow-start.sentinelone.net");
+    expect(first.statusCode).toBe(502);
+    expect(first.json().error.code).toBe(-32002);
+    expect(first.json().error.message).toContain("did not become ready");
+
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.json().tenants).toBe(1);
+    expect(pids()).toHaveLength(1);
+
+    await new Promise((r) => setTimeout(r, 400));
+    const second = await post("tok-slow-start", "https://slow-start.sentinelone.net");
+    expect(second.statusCode).toBe(200);
+    expect(pids()).toHaveLength(1);
+  });
+
+  it.each([
+    { mode: "fail", delay: "900", message: "exited before ready" },
+    { mode: "serve", delay: "10000", message: "did not become ready" },
+  ])("forgets the child when the follow-up wait fails ($mode)", async ({ mode, delay, message }) => {
+    process.env.SPAWN_READY_TIMEOUT_MS = "600";
+    process.env.SPAWN_DELAY_MS = delay;
+    process.env.SPAWN_MODE = mode;
+    const token = `tok-follow-up-${mode}`;
+    const baseUrl = `https://follow-up-${mode}.sentinelone.net`;
+
+    const first = await post(token, baseUrl);
+    expect(first.statusCode).toBe(502);
+    expect(first.json().error.message).toContain("did not become ready");
+    const mid = await app.inject({ method: "GET", url: "/health" });
+    expect(mid.json().tenants).toBe(1);
+
+    const second = await post(token, baseUrl);
+    expect(second.statusCode).toBe(502);
+    expect(second.json().error.code).toBe(-32002);
+    expect(second.json().error.message).toContain(message);
+    expect(pids()).toHaveLength(1);
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.json().tenants).toBe(0);
+  });
+
   it("counts an in-flight spawn toward MAX_CHILDREN", async () => {
     const [a, b] = await Promise.all([
       post("tok-a", "https://a.sentinelone.net"),
