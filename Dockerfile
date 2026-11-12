@@ -20,6 +20,10 @@
 # vendor MCP server (POST http://gwp-sentinelone:8080/mcp).
 
 # ---- Stage 1: install purple-mcp into a virtualenv via uv ----
+# Upstream's uv.lock lags behind security fixes, so selected transitive deps are
+# bumped with `uv lock --upgrade-package` (never past a major that upstream's
+# pyproject constraints forbid). fastmcp 2 -> 3 and starlette 0.x -> 1.x are
+# deliberately NOT bumped here: major migrations belong upstream.
 # The uv image and the runtime stage must BOTH be built on the same python
 # minor version, so the system interpreter lives at the same path in both. We
 # pin uv to that system python (UV_PYTHON_PREFERENCE=only-system +
@@ -56,15 +60,23 @@ RUN git clone --depth=1 --branch "${PURPLE_MCP_REF}" \
       https://github.com/Sentinel-One/purple-mcp.git /opt/purple-mcp \
  && cd /opt/purple-mcp \
  && git submodule update --init --recursive --depth=1 \
+ && uv lock \
+      --upgrade-package aiohttp --upgrade-package anyio --upgrade-package authlib \
+      --upgrade-package certifi --upgrade-package cryptography --upgrade-package dnspython \
+      --upgrade-package idna --upgrade-package mcp --upgrade-package msgpack \
+      --upgrade-package multidict --upgrade-package opentelemetry-api --upgrade-package protobuf \
+      --upgrade-package pyjwt --upgrade-package python-dotenv --upgrade-package python-multipart \
+      --upgrade-package requests --upgrade-package urllib3 --upgrade-package setuptools \
+      --upgrade-package pydantic-settings --upgrade-package jaraco.context \
  && uv sync --locked --no-dev --python /usr/local/bin/python3.14
 
 # ---- Stage 2: build the Node proxy ----
 FROM node:26-bookworm-slim AS proxy-build
 WORKDIR /app
 COPY package.json package-lock.json* tsconfig.json ./
-RUN npm install
+RUN npm ci --no-audit --no-fund
 COPY src ./src
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
 # ---- Stage 3: runtime image ----
 FROM python:3.14-slim AS runtime
@@ -78,12 +90,16 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080 \
     MCP_HTTP_HOST=0.0.0.0
 
-# Install Node.js 22 (no apt repo - use the official tarball)
+# Install Node.js 22 (no apt repo - use the official tarball). The bundled npm
+# CLI is removed: the runtime only runs `node dist/index.js` and curl.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
- && curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
+ && curl -fsSL https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.xz -o /tmp/node.tar.xz \
  && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
  && rm /tmp/node.tar.xz \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
  && rm -rf /var/lib/apt/lists/*
 
 # Bring in purple-mcp + its venv
