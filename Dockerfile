@@ -20,10 +20,6 @@
 # vendor MCP server (POST http://gwp-sentinelone:8080/mcp).
 
 # ---- Stage 1: install purple-mcp into a virtualenv via uv ----
-# Upstream's uv.lock lags behind security fixes, so selected transitive deps are
-# bumped with `uv lock --upgrade-package` (never past a major that upstream's
-# pyproject constraints forbid). fastmcp 2 -> 3 and starlette 0.x -> 1.x are
-# deliberately NOT bumped here: major migrations belong upstream.
 # The uv image and the runtime stage must BOTH be built on the same python
 # minor version, so the system interpreter lives at the same path in both. We
 # pin uv to that system python (UV_PYTHON_PREFERENCE=only-system +
@@ -47,28 +43,32 @@
 # `/opt/purple-mcp/.venv/bin/python: not found`) instead of shipping a broken
 # image. Keep this stage's python tag and the runtime stage's FROM tag in
 # lockstep on every future base-image bump.
+#
+# Upstream's uv.lock lags behind security fixes, so upstream-constraints.txt
+# pins explicit newer versions that are installed over the locked venv. The
+# upstream ref is pinned to a commit SHA, so the image is reproducible; bump the
+# SHA and constraints together. fastmcp 2 -> 3 and starlette 0.x -> 1.x are NOT
+# bumped: major migrations belong upstream.
 FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS upstream
 
-ENV PURPLE_MCP_REF=main \
+ENV PURPLE_MCP_REF=3984b7050638dbeab1dc86185a21f8b3d20b11f4 \
     UV_PYTHON_PREFERENCE=only-system \
     UV_PYTHON_DOWNLOADS=never
 WORKDIR /opt
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth=1 --branch "${PURPLE_MCP_REF}" \
-      https://github.com/Sentinel-One/purple-mcp.git /opt/purple-mcp \
+COPY upstream-constraints.txt /opt/upstream-constraints.txt
+RUN git init -q /opt/purple-mcp \
  && cd /opt/purple-mcp \
+ && git remote add origin https://github.com/Sentinel-One/purple-mcp.git \
+ && git fetch --depth=1 origin "${PURPLE_MCP_REF}" \
+ && git checkout -q FETCH_HEAD \
  && git submodule update --init --recursive --depth=1 \
- && uv lock \
-      --upgrade-package aiohttp --upgrade-package anyio --upgrade-package authlib \
-      --upgrade-package certifi --upgrade-package cryptography --upgrade-package dnspython \
-      --upgrade-package idna --upgrade-package mcp --upgrade-package msgpack \
-      --upgrade-package multidict --upgrade-package opentelemetry-api --upgrade-package protobuf \
-      --upgrade-package pyjwt --upgrade-package python-dotenv --upgrade-package python-multipart \
-      --upgrade-package requests --upgrade-package urllib3 --upgrade-package setuptools \
-      --upgrade-package pydantic-settings --upgrade-package jaraco.context \
- && uv sync --locked --no-dev --python /usr/local/bin/python3.14
+ && uv sync --locked --no-dev --python /usr/local/bin/python3.14 \
+ && uv pip install --python /opt/purple-mcp/.venv/bin/python \
+      --constraint /opt/upstream-constraints.txt \
+      -r /opt/upstream-constraints.txt
 
 # ---- Stage 2: build the Node proxy ----
 FROM node:26-bookworm-slim AS proxy-build
