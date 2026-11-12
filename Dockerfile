@@ -43,28 +43,40 @@
 # `/opt/purple-mcp/.venv/bin/python: not found`) instead of shipping a broken
 # image. Keep this stage's python tag and the runtime stage's FROM tag in
 # lockstep on every future base-image bump.
+#
+# Upstream's uv.lock lags behind security fixes, so upstream-constraints.txt
+# pins explicit newer versions that are installed over the locked venv. The
+# upstream ref is pinned to a commit SHA, so the image is reproducible; bump the
+# SHA and constraints together. fastmcp 2 -> 3 and starlette 0.x -> 1.x are NOT
+# bumped: major migrations belong upstream.
 FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS upstream
 
-ENV PURPLE_MCP_REF=main \
+ENV PURPLE_MCP_REF=3984b7050638dbeab1dc86185a21f8b3d20b11f4 \
     UV_PYTHON_PREFERENCE=only-system \
     UV_PYTHON_DOWNLOADS=never
 WORKDIR /opt
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth=1 --branch "${PURPLE_MCP_REF}" \
-      https://github.com/Sentinel-One/purple-mcp.git /opt/purple-mcp \
+COPY upstream-constraints.txt /opt/upstream-constraints.txt
+RUN git init -q /opt/purple-mcp \
  && cd /opt/purple-mcp \
+ && git remote add origin https://github.com/Sentinel-One/purple-mcp.git \
+ && git fetch --depth=1 origin "${PURPLE_MCP_REF}" \
+ && git checkout -q FETCH_HEAD \
  && git submodule update --init --recursive --depth=1 \
- && uv sync --locked --no-dev --python /usr/local/bin/python3.14
+ && uv sync --locked --no-dev --python /usr/local/bin/python3.14 \
+ && uv pip install --python /opt/purple-mcp/.venv/bin/python \
+      --constraint /opt/upstream-constraints.txt \
+      -r /opt/upstream-constraints.txt
 
 # ---- Stage 2: build the Node proxy ----
 FROM node:26-bookworm-slim AS proxy-build
 WORKDIR /app
 COPY package.json package-lock.json* tsconfig.json ./
-RUN npm install
+RUN npm ci --no-audit --no-fund
 COPY src ./src
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
 # ---- Stage 3: runtime image ----
 FROM python:3.14-slim AS runtime
@@ -78,12 +90,16 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080 \
     MCP_HTTP_HOST=0.0.0.0
 
-# Install Node.js 22 (no apt repo - use the official tarball)
+# Install Node.js 22 (no apt repo - use the official tarball). The bundled npm
+# CLI is removed: the runtime only runs `node dist/index.js` and curl.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
- && curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
+ && curl -fsSL https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.xz -o /tmp/node.tar.xz \
  && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
  && rm /tmp/node.tar.xz \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
  && rm -rf /var/lib/apt/lists/*
 
 # Bring in purple-mcp + its venv
