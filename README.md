@@ -45,6 +45,8 @@ This server is gateway mode. It does not read `PURPLEMCP_CONSOLE_TOKEN` or `PURP
 | `x-purplemcp-token` | Legacy alias for the API token. |
 | `x-purplemcp-base-url` | Legacy alias for the console URL. |
 
+Console URLs from `X-S1-Console-URL` or `x-purplemcp-base-url` have surrounding whitespace and trailing slashes stripped before being passed to purple-mcp.
+
 ### X-Gateway-S2S
 
 With `CONDUIT_S2S_SECRET` set, every `POST /mcp` must include `X-Gateway-S2S`. The check is `verifyS2sHeader` in [`src/s2s-verify.ts`](src/s2s-verify.ts): the header value is `t=<unix seconds>,v1=<hex>`, where the hex is HMAC-SHA256 of the literal string `t=<unix seconds>` keyed with `CONDUIT_S2S_SECRET` (64 lowercase hex characters). The timestamp must be within 300 seconds of the server clock. A missing or invalid header is HTTP 401, before tenant credentials are read, and the secret is not logged.
