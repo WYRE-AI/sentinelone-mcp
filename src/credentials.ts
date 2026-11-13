@@ -33,10 +33,15 @@ function firstHeader(headers: IncomingHttpHeaders, name: string): string | undef
   return undefined;
 }
 
+function normalizeConsoleUrl(value: string | undefined): string | undefined {
+  return value?.trim().replace(/\/+$/, "") || undefined;
+}
+
 export function readTenantCredentials(headers: IncomingHttpHeaders): TenantCredentials | null {
   const token = firstHeader(headers, HEADER_S1_TOKEN) ?? firstHeader(headers, HEADER_PURPLE_TOKEN);
   const baseUrl =
-    firstHeader(headers, HEADER_S1_BASE_URL) ?? firstHeader(headers, HEADER_PURPLE_BASE_URL);
+    normalizeConsoleUrl(firstHeader(headers, HEADER_S1_BASE_URL)) ??
+    normalizeConsoleUrl(firstHeader(headers, HEADER_PURPLE_BASE_URL));
   if (!token || !baseUrl) return null;
   return { token, baseUrl };
 }

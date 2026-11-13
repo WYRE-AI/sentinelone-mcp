@@ -7,6 +7,38 @@ function headers(input: Record<string, string | string[]>): IncomingHttpHeaders 
 }
 
 describe("readTenantCredentials", () => {
+  describe.each(["x-s1-console-url", "x-purplemcp-base-url"])("%s normalization", (header) => {
+    it.each([
+      ["https://tenant.sentinelone.net/", "https://tenant.sentinelone.net"],
+      ["https://tenant.sentinelone.net///", "https://tenant.sentinelone.net"],
+      [" \t https://tenant.sentinelone.net/ \n", "https://tenant.sentinelone.net"],
+      ["https://tenant.sentinelone.net", "https://tenant.sentinelone.net"],
+      ["https://tenant.sentinelone.net/path///", "https://tenant.sentinelone.net/path"],
+    ])("normalizes %j to %j", (input, expected) => {
+      expect(
+        readTenantCredentials(headers({ "x-s1-api-token": " tok/ ", [header]: input })),
+      ).toEqual({ token: "tok/", baseUrl: expected });
+    });
+
+    it.each(["/", "///", " \t /// \n", "   "])("treats %j as missing", (input) => {
+      expect(
+        readTenantCredentials(headers({ "x-s1-api-token": "tok", [header]: input })),
+      ).toBeNull();
+    });
+  });
+
+  it("falls back to the legacy URL when the catalog URL contains only slashes and whitespace", () => {
+    expect(
+      readTenantCredentials(
+        headers({
+          "x-s1-api-token": "tok",
+          "x-s1-console-url": " /// ",
+          "x-purplemcp-base-url": " https://legacy.example/ ",
+        }),
+      ),
+    ).toEqual({ token: "tok", baseUrl: "https://legacy.example" });
+  });
+
   it("reads catalog X-S1 headers (already lowercased, as Node exposes them)", () => {
     expect(
       readTenantCredentials(
