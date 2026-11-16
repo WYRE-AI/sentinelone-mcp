@@ -1,0 +1,26 @@
+# Exact pins applied on top of purple-mcp's own uv.lock (Dockerfile stage 1) to
+# pick up security fixes its lock lags behind on. Every version is explicit, so
+# the same inputs always build the same image. fastmcp (2.x -> 3.x) and
+# starlette (0.x -> 1.x) are deliberately left at upstream's locked versions:
+# those are major migrations that belong upstream.
+# To bump: edit versions here and let the PR image build (smoke test) gate it.
+aiohttp==3.14.4
+anyio==4.14.2
+authlib==1.9.1
+certifi==2026.10.18
+cryptography==50.0.0
+dnspython==2.9.0
+idna==3.15
+jaraco.context==6.1.0
+mcp==1.30.0
+msgpack==1.2.3
+multidict==6.9.1
+opentelemetry-api==1.45.1
+protobuf==6.33.5
+pydantic-settings==2.14.2
+pyjwt==2.15.0
+python-dotenv==1.2.2
+python-multipart==0.0.30
+requests==2.33.0
+setuptools==84.1.0
+urllib3==2.8.0
