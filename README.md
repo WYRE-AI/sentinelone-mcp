@@ -1,6 +1,6 @@
 # sentinelone-mcp
 
-Multitenant Streamable HTTP wrapper for [sentinel-one/purple-mcp](https://github.com/Sentinel-One/purple-mcp), built so the [wyre-technology MCP gateway](https://github.com/wyre-technology/mcp-gateway) can forward per-tenant SentinelOne credentials as HTTP headers.
+Multitenant Streamable HTTP wrapper for [sentinel-one/purple-mcp](https://github.com/Sentinel-One/purple-mcp), built so the WYRE-AI MCP gateway can forward per-tenant SentinelOne credentials as HTTP headers.
 
 ## Why
 
